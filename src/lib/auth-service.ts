@@ -1,21 +1,22 @@
 import bcrypt from 'bcryptjs'
 import speakeasy from 'speakeasy'
 import { v4 as uuidv4 } from 'uuid'
-import { supabaseAdmin, type AuthUser } from './supabase'
+import { NextRequest } from 'next/server'
+import { supabase, type AuthResult, type SessionResult, type User2FAStatus } from './supabase'
 
 // Security configuration
 const SECURITY_CONFIG = {
   MAX_LOGIN_ATTEMPTS: 5,
   LOCKOUT_DURATION_MINUTES: 30,
-  SESSION_DURATION_HOURS: 2, // Force re-login every 2 hours
+  SESSION_DURATION_HOURS: 2,
   PASSWORD_MIN_LENGTH: 8,
   REQUIRE_2FA: true,
-  SESSION_CLEANUP_INTERVAL: 300000, // 5 minutes
+  BCRYPT_ROUNDS: 12,
 } as const
 
 export interface LoginResult {
   success: boolean
-  user?: Partial<AuthUser>
+  user?: { id: string; username: string }
   sessionId?: string
   requiresSetup2FA?: boolean
   error?: string
@@ -25,7 +26,7 @@ export interface LoginResult {
 
 export interface VerifyTokenResult {
   success: boolean
-  user?: Partial<AuthUser>
+  user?: { id: string; username: string }
   sessionId?: string
   error?: string
 }
@@ -33,7 +34,7 @@ export interface VerifyTokenResult {
 export class AuthService {
   
   /**
-   * Authenticate user with username and password
+   * Authenticate user with username and password using secure database function
    */
   static async authenticateUser(
     username: string, 
@@ -44,132 +45,80 @@ export class AuthService {
     try {
       // Input validation
       if (!username || !password) {
-        await this.logAuthAttempt(null, username, 'LOGIN_ATTEMPT', ipAddress, userAgent, false, 'Missing credentials')
         return { success: false, error: 'Username and password are required' }
       }
 
-      // Clean up expired sessions and locks first
-      await this.cleanupExpiredSessions()
-      await this.unlockExpiredAccounts()
+      // Hash password for database comparison
+      const hashedPassword = await bcrypt.hash(password, SECURITY_CONFIG.BCRYPT_ROUNDS)
 
-      // Get user from database
-      const { data: user, error } = await supabaseAdmin
-        .from('auth_users')
-        .select('*')
-        .eq('username', username)
-        .eq('is_active', true)
-        .single()
+      // Call secure database function with anon key
+      const { data, error } = await supabase.rpc('authenticate_user', {
+        p_username: username,
+        p_password_hash: hashedPassword,
+        p_ip_address: ipAddress || null,
+        p_user_agent: userAgent || null
+      })
 
-      if (error || !user) {
-        await this.logAuthAttempt(null, username, 'LOGIN_ATTEMPT', ipAddress, userAgent, false, 'User not found')
-        return { success: false, error: 'Invalid credentials' }
+      if (error) {
+        console.error('Database authentication error:', error)
+        return { success: false, error: 'Authentication service error' }
       }
 
-      // Check if account is locked
-      if (user.locked_until && new Date(user.locked_until) > new Date()) {
-        const lockoutMinutes = Math.ceil((new Date(user.locked_until).getTime() - Date.now()) / 60000)
-        await this.logAuthAttempt(user.id, username, 'LOGIN_BLOCKED', ipAddress, userAgent, false, 'Account locked')
-        return { 
-          success: false, 
-          error: 'Account is temporarily locked due to multiple failed attempts',
-          isLocked: true,
-          lockoutMinutes
-        }
-      }
+      const result = data as AuthResult
 
-      // Verify password
-      const passwordMatch = await bcrypt.compare(password, user.password_hash)
-      
-      if (!passwordMatch) {
-        // Increment failed attempts
-        const newFailedAttempts = user.failed_login_attempts + 1
-        let lockUntil = null
-        
-        if (newFailedAttempts >= SECURITY_CONFIG.MAX_LOGIN_ATTEMPTS) {
-          lockUntil = new Date(Date.now() + SECURITY_CONFIG.LOCKOUT_DURATION_MINUTES * 60000).toISOString()
-        }
-
-        await supabaseAdmin
-          .from('auth_users')
-          .update({
-            failed_login_attempts: newFailedAttempts,
-            locked_until: lockUntil,
-            updated_at: new Date().toISOString()
-          })
-          .eq('id', user.id)
-
-        await this.logAuthAttempt(user.id, username, 'LOGIN_FAILED', ipAddress, userAgent, false, 'Invalid password')
-        
-        if (lockUntil) {
+      if (!result.success) {
+        // Handle account lockout
+        if (result.locked_until) {
+          const lockoutMinutes = Math.ceil(
+            (new Date(result.locked_until).getTime() - Date.now()) / 60000
+          )
           return { 
             success: false, 
-            error: 'Account has been locked due to multiple failed attempts',
+            error: result.error_message || 'Account locked',
             isLocked: true,
-            lockoutMinutes: SECURITY_CONFIG.LOCKOUT_DURATION_MINUTES
+            lockoutMinutes: Math.max(0, lockoutMinutes)
           }
         }
-
-        return { success: false, error: 'Invalid credentials' }
+        
+        return { success: false, error: result.error_message || 'Authentication failed' }
       }
 
-      // Reset failed attempts on successful password verification
-      await supabaseAdmin
-        .from('auth_users')
-        .update({
-          failed_login_attempts: 0,
-          locked_until: null,
-          last_login: new Date().toISOString(),
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', user.id)
-
-      await this.logAuthAttempt(user.id, username, 'PASSWORD_VERIFIED', ipAddress, userAgent, true)
-
-      // Check if 2FA setup is required
-      if (!user.has_2fa) {
-        return {
-          success: true,
-          user: { id: user.id, username: user.username },
-          requiresSetup2FA: true
-        }
-      }
-
-      // Return success (still need 2FA verification)
+      // Success
       return {
         success: true,
-        user: { id: user.id, username: user.username, has_2fa: user.has_2fa }
+        user: { id: result.user_id!, username: result.username! },
+        sessionId: result.session_id,
+        requiresSetup2FA: result.requires_2fa
       }
 
     } catch (error) {
       console.error('Authentication error:', error)
-      await this.logAuthAttempt(null, username, 'LOGIN_ERROR', ipAddress, userAgent, false, 'System error')
       return { success: false, error: 'Authentication system error' }
     }
   }
 
   /**
-   * Setup 2FA for user
+   * Setup 2FA for user using secure database function
    */
-  static async setup2FA(userId: string): Promise<{ secret: string; qrCode: string } | null> {
+  static async setup2FA(sessionId: string): Promise<{ secret: string; qrCode: string } | null> {
     try {
-      const user = await this.getUserById(userId)
-      if (!user) return null
-
       // Generate new secret
       const secret = speakeasy.generateSecret({
-        name: `Y-Be.tech CRM (${user.username})`,
+        name: 'Y-Be.tech CRM',
         issuer: 'Y-Be.tech',
         length: 32
       })
 
-      // Store secret temporarily (will be confirmed after verification)
-      await supabaseAdmin
-        .from('auth_users')
-        .update({
-          two_fa_secret: secret.base32,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', userId)
+      // Store secret using secure database function
+      const { data, error } = await supabase.rpc('setup_user_2fa', {
+        p_session_id: sessionId,
+        p_two_fa_secret: secret.base32
+      })
+
+      if (error || !data) {
+        console.error('2FA setup error:', error)
+        return null
+      }
 
       return {
         secret: secret.base32,
@@ -182,108 +131,107 @@ export class AuthService {
   }
 
   /**
-   * Verify 2FA token and create session
+   * Get user 2FA status using secure database function
+   */
+  static async get2FAStatus(sessionId: string): Promise<User2FAStatus | null> {
+    try {
+      const { data, error } = await supabase.rpc('get_user_2fa_status', {
+        p_session_id: sessionId
+      })
+
+      if (error || !data || data.length === 0) {
+        return null
+      }
+
+      return data[0] as User2FAStatus
+    } catch (error) {
+      console.error('2FA status check error:', error)
+      return null
+    }
+  }
+
+  /**
+   * Verify 2FA token and complete setup if needed
    */
   static async verify2FA(
-    userId: string, 
+    sessionId: string, 
     token: string,
     ipAddress?: string,
     userAgent?: string
   ): Promise<VerifyTokenResult> {
     try {
-      const user = await this.getUserById(userId)
-      if (!user) {
-        await this.logAuthAttempt(userId, null, '2FA_FAILED', ipAddress, userAgent, false, 'User not found')
-        return { success: false, error: 'User not found' }
-      }
-
-      if (!user.two_fa_secret) {
-        await this.logAuthAttempt(userId, user.username, '2FA_FAILED', ipAddress, userAgent, false, 'No 2FA secret')
+      // Get user 2FA status
+      const status = await this.get2FAStatus(sessionId)
+      if (!status || !status.two_fa_secret) {
         return { success: false, error: '2FA not set up' }
       }
 
       // Verify token
       const verified = speakeasy.totp.verify({
-        secret: user.two_fa_secret,
+        secret: status.two_fa_secret,
         encoding: 'base32',
         token: token,
         window: 1 // Allow 1 step before/after for clock skew
       })
 
       if (!verified) {
-        await this.logAuthAttempt(userId, user.username, '2FA_FAILED', ipAddress, userAgent, false, 'Invalid token')
         return { success: false, error: 'Invalid verification code' }
       }
 
-      // Generate session
-      const sessionId = uuidv4()
-      const sessionExpiry = new Date(Date.now() + SECURITY_CONFIG.SESSION_DURATION_HOURS * 60 * 60 * 1000)
-
-      // Update user with session and mark 2FA as complete
-      await supabaseAdmin
-        .from('auth_users')
-        .update({
-          has_2fa: true,
-          session_id: sessionId,
-          session_expires_at: sessionExpiry.toISOString(),
-          last_login: new Date().toISOString(),
-          updated_at: new Date().toISOString()
+      // Complete 2FA setup if this is the first verification
+      if (!status.has_2fa) {
+        const { data, error } = await supabase.rpc('complete_2fa_setup', {
+          p_session_id: sessionId
         })
-        .eq('id', userId)
 
-      await this.logAuthAttempt(userId, user.username, '2FA_SUCCESS', ipAddress, userAgent, true, undefined, sessionId)
+        if (error || !data) {
+          return { success: false, error: '2FA completion failed' }
+        }
+      }
+
+      // Verify session is still valid
+      const sessionResult = await this.validateSession(sessionId)
+      if (!sessionResult) {
+        return { success: false, error: 'Session expired' }
+      }
 
       return {
         success: true,
-        user: { id: user.id, username: user.username },
+        user: { id: sessionResult.user_id!, username: sessionResult.username! },
         sessionId
       }
     } catch (error) {
       console.error('2FA verification error:', error)
-      await this.logAuthAttempt(userId, null, '2FA_ERROR', ipAddress, userAgent, false, 'System error')
       return { success: false, error: '2FA verification system error' }
     }
   }
 
-  /**
-   * Validate session
+    /**
+   * Validate an existing session
    */
-  static async validateSession(sessionId: string): Promise<AuthUser | null> {
+  static async validateSession(sessionId: string): Promise<SessionResult | null> {
     try {
-      if (!sessionId) return null
+      const { data, error } = await supabase
+        .rpc('verify_session', {
+          p_session_id: sessionId
+        })
 
-      await this.cleanupExpiredSessions()
-
-      const { data: user, error } = await supabaseAdmin
-        .from('auth_users')
-        .select('*')
-        .eq('session_id', sessionId)
-        .eq('is_active', true)
-        .gte('session_expires_at', new Date().toISOString())
-        .single()
-
-      if (error || !user) return null
-
-      // Extend session if it's going to expire soon (within 30 minutes)
-      const expiryTime = new Date(user.session_expires_at!).getTime()
-      const now = Date.now()
-      const thirtyMinutes = 30 * 60 * 1000
-
-      if (expiryTime - now < thirtyMinutes) {
-        const newExpiry = new Date(now + SECURITY_CONFIG.SESSION_DURATION_HOURS * 60 * 60 * 1000)
-        
-        await supabaseAdmin
-          .from('auth_users')
-          .update({
-            session_expires_at: newExpiry.toISOString(),
-            updated_at: new Date().toISOString()
-          })
-          .eq('id', user.id)
-
-        user.session_expires_at = newExpiry.toISOString()
+      if (error) {
+        console.error('Session validation error:', error)
+        return null
       }
 
-      return user
+      if (!data || data.length === 0) {
+        return null
+      }
+
+      const sessionData = data[0]
+      return {
+        valid: sessionData.is_valid,
+        user_id: sessionData.is_valid ? sessionData.user_id : undefined,
+        username: sessionData.is_valid ? sessionData.username : undefined,
+        expires_at: sessionData.is_valid ? sessionData.expires_at : undefined
+      }
     } catch (error) {
       console.error('Session validation error:', error)
       return null
@@ -291,26 +239,20 @@ export class AuthService {
   }
 
   /**
-   * Invalidate session (logout)
+   * Invalidate session (logout) using secure database function
    */
-  static async invalidateSession(sessionId: string, ipAddress?: string, userAgent?: string): Promise<boolean> {
+  static async invalidateSession(sessionId: string): Promise<boolean> {
     try {
-      const user = await this.validateSession(sessionId)
-      
-      const { error } = await supabaseAdmin
-        .from('auth_users')
-        .update({
-          session_id: null,
-          session_expires_at: null,
-          updated_at: new Date().toISOString()
-        })
-        .eq('session_id', sessionId)
+      const { data, error } = await supabase.rpc('logout_user', {
+        p_session_id: sessionId
+      })
 
-      if (user) {
-        await this.logAuthAttempt(user.id, user.username, 'LOGOUT', ipAddress, userAgent, true, undefined, sessionId)
+      if (error) {
+        console.error('Session invalidation error:', error)
+        return false
       }
 
-      return !error
+      return data as boolean
     } catch (error) {
       console.error('Session invalidation error:', error)
       return false
@@ -318,99 +260,41 @@ export class AuthService {
   }
 
   /**
-   * Get user by ID
+   * Logout and invalidate session
    */
-  static async getUserById(userId: string): Promise<AuthUser | null> {
+  static async logout(sessionId: string, ipAddress?: string, userAgent?: string): Promise<void> {
     try {
-      const { data: user, error } = await supabaseAdmin
-        .from('auth_users')
-        .select('*')
-        .eq('id', userId)
-        .eq('is_active', true)
-        .single()
-
-      return error ? null : user
+      await supabase
+        .rpc('logout_user', {
+          p_session_id: sessionId,
+          p_ip_address: ipAddress,
+          p_user_agent: userAgent
+        })
     } catch (error) {
-      console.error('Get user error:', error)
-      return null
+      console.error('Logout error:', error)
+      // Don't throw - logout should always succeed from client perspective
     }
   }
 
   /**
-   * Log authentication attempt
+   * Get client IP address from request headers
    */
-  static async logAuthAttempt(
-    userId: string | null,
-    username: string | null,
-    action: string,
-    ipAddress?: string,
-    userAgent?: string,
-    success: boolean = false,
-    failureReason?: string,
-    sessionId?: string
-  ): Promise<void> {
-    try {
-      await supabaseAdmin.rpc('log_auth_attempt', {
-        p_user_id: userId,
-        p_username: username,
-        p_action: action,
-        p_ip_address: ipAddress,
-        p_user_agent: userAgent,
-        p_success: success,
-        p_failure_reason: failureReason,
-        p_session_id: sessionId
-      })
-    } catch (error) {
-      console.error('Failed to log auth attempt:', error)
-    }
-  }
-
-  /**
-   * Clean up expired sessions
-   */
-  static async cleanupExpiredSessions(): Promise<void> {
-    try {
-      await supabaseAdmin.rpc('clean_expired_sessions')
-    } catch (error) {
-      console.error('Failed to clean expired sessions:', error)
-    }
-  }
-
-  /**
-   * Unlock expired account locks
-   */
-  static async unlockExpiredAccounts(): Promise<void> {
-    try {
-      await supabaseAdmin.rpc('unlock_expired_locks')
-    } catch (error) {
-      console.error('Failed to unlock expired accounts:', error)
-    }
-  }
-
-  /**
-   * Get client IP address from request
-   */
-  static getClientIP(request: Request): string {
+  static getClientIP(request: NextRequest): string | undefined {
     const forwarded = request.headers.get('x-forwarded-for')
-    const real = request.headers.get('x-real-ip')
-    const host = request.headers.get('host')
+    const realIp = request.headers.get('x-real-ip')
+    const remoteAddr = request.headers.get('remote-addr')
     
     if (forwarded) {
       return forwarded.split(',')[0].trim()
     }
     
-    if (real) {
-      return real
-    }
-    
-    return host || 'unknown'
+    return realIp || remoteAddr || undefined
   }
-}
 
-// Schedule periodic cleanup (in a real app, this would be handled by a cron job)
-if (typeof window === 'undefined') {
-  setInterval(() => {
-    AuthService.cleanupExpiredSessions()
-    AuthService.unlockExpiredAccounts()
-  }, SECURITY_CONFIG.SESSION_CLEANUP_INTERVAL)
+  /**
+   * Generate a strong JWT secret
+   */
+  static generateJWTSecret(): string {
+    return uuidv4() + uuidv4().replace(/-/g, '')
+  }
 }

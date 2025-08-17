@@ -1,47 +1,42 @@
 import { createClient } from '@supabase/supabase-js'
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!
+// Use anon key only - all security enforced at database function level
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 
-if (!supabaseUrl || !supabaseServiceKey) {
+if (!supabaseUrl || !supabaseAnonKey) {
   throw new Error('Missing Supabase environment variables')
 }
 
-// Service role client for server-side operations
-export const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
+// Secure client using anon key with database-level security
+export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
   auth: {
     autoRefreshToken: false,
     persistSession: false
   }
 })
 
-// Database types
-export interface AuthUser {
-  id: string
-  username: string
-  password_hash: string
-  is_active: boolean
-  has_2fa: boolean
-  two_fa_secret: string | null
-  failed_login_attempts: number
-  locked_until: string | null
-  last_login: string | null
-  last_password_change: string
-  session_id: string | null
-  session_expires_at: string | null
-  created_at: string
-  updated_at: string
+// Database types for secure function responses
+export interface AuthResult {
+  success: boolean
+  user_id?: string
+  username?: string
+  requires_2fa?: boolean
+  session_id?: string
+  session_expires_at?: string
+  error_message?: string
+  locked_until?: string
 }
 
-export interface AuthAuditLog {
-  id: string
-  user_id: string | null
-  username: string | null
-  action: string
-  ip_address: string | null
-  user_agent: string | null
-  success: boolean
-  failure_reason: string | null
-  session_id: string | null
-  created_at: string
+export interface SessionResult {
+  valid: boolean
+  user_id?: string
+  username?: string
+  expires_at?: string
+  error_message?: string
+}
+
+export interface User2FAStatus {
+  has_2fa: boolean
+  two_fa_secret: string | null
 }

@@ -17,7 +17,7 @@ export async function POST(request: NextRequest) {
     const ipAddress = AuthService.getClientIP(request)
     const userAgent = request.headers.get('user-agent') || undefined
 
-    // Authenticate user
+    // Authenticate user using secure database function
     const result = await AuthService.authenticateUser(username, password, ipAddress, userAgent)
 
     if (!result.success) {
@@ -36,6 +36,7 @@ export async function POST(request: NextRequest) {
     const token = await new SignJWT({ 
       userId: result.user!.id, 
       username: result.user!.username,
+      sessionId: result.sessionId,
       step: result.requiresSetup2FA ? 'needs-2fa-setup' : 'needs-2fa-verification'
     })
       .setProtectedHeader({ alg: 'HS256' })

@@ -4,55 +4,48 @@ import { AuthService } from '@/lib/auth-service'
 
 export async function GET(request: NextRequest) {
   try {
-    const token = request.cookies.get('auth-token')?.value
+    const authToken = request.cookies.get('auth-token')?.value
 
-    if (!token) {
+    if (!authToken) {
       return NextResponse.json(
         { error: 'Not authenticated' },
         { status: 401 }
       )
     }
 
-    // Verify token
+    // Verify JWT token
     const secret = new TextEncoder().encode(process.env.JWT_SECRET || 'fallback-secret')
-    const { payload } = await jwtVerify(token, secret)
+    const { payload } = await jwtVerify(authToken, secret)
     
-    // Check if user is fully authenticated (passed 2FA)
-    if (payload.step !== 'fully-authenticated') {
-      return NextResponse.json(
-        { error: 'Authentication not complete' },
-        { status: 401 }
-      )
-    }
-
     const sessionId = payload.sessionId as string
     if (!sessionId) {
       return NextResponse.json(
-        { error: 'No session found' },
+        { error: 'Invalid session' },
         { status: 401 }
       )
     }
 
-    // Validate session in database
-    const user = await AuthService.validateSession(sessionId)
-    if (!user) {
+    // Validate session using secure database function
+    const result = await AuthService.validateSession(sessionId)
+
+    if (!result || !result.valid) {
       return NextResponse.json(
-        { error: 'Session expired or invalid' },
+        { error: result?.error_message || 'Session invalid' },
         { status: 401 }
       )
     }
 
     return NextResponse.json({
-      userId: user.id,
-      username: user.username,
-      authenticated: true,
-      sessionExpiresAt: user.session_expires_at
+      user: {
+        id: result.user_id!,
+        username: result.username!
+      }
     })
   } catch (error) {
-    console.error('Auth check error:', error)
+    console.error('Profile fetch error:', error)
     return NextResponse.json(
-      { error: 'Invalid token' },
-      { status: 401 }
+      { error: 'Internal server error' },
+      { status: 500 }
     )
   }
 }

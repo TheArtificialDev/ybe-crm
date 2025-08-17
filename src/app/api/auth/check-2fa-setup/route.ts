@@ -18,18 +18,18 @@ export async function GET(request: NextRequest) {
     const secret = new TextEncoder().encode(process.env.JWT_SECRET || 'fallback-secret')
     const { payload } = await jwtVerify(token, secret)
     
-    const userId = payload.userId as string
-    if (!userId) {
+    const sessionId = payload.sessionId as string
+    if (!sessionId) {
       return NextResponse.json(
-        { error: 'Invalid token' },
+        { error: 'Invalid session' },
         { status: 401 }
       )
     }
 
     // Check if user needs to set up 2FA
     if (payload.step === 'needs-2fa-setup') {
-      // Generate 2FA secret and QR code
-      const setup = await AuthService.setup2FA(userId)
+      // Generate 2FA secret and QR code using secure database function
+      const setup = await AuthService.setup2FA(sessionId)
       
       if (!setup) {
         return NextResponse.json(

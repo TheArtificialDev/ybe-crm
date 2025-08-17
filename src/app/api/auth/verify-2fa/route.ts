@@ -25,10 +25,10 @@ export async function POST(request: NextRequest) {
     const secret = new TextEncoder().encode(process.env.JWT_SECRET || 'fallback-secret')
     const { payload } = await jwtVerify(authToken, secret)
     
-    const userId = payload.userId as string
-    if (!userId) {
+    const sessionId = payload.sessionId as string
+    if (!sessionId) {
       return NextResponse.json(
-        { error: 'Invalid token' },
+        { error: 'Invalid session' },
         { status: 401 }
       )
     }
@@ -37,8 +37,8 @@ export async function POST(request: NextRequest) {
     const ipAddress = AuthService.getClientIP(request)
     const userAgent = request.headers.get('user-agent') || undefined
 
-    // Verify 2FA token and create session
-    const result = await AuthService.verify2FA(userId, userToken, ipAddress, userAgent)
+    // Verify 2FA token using secure database function
+    const result = await AuthService.verify2FA(sessionId, userToken, ipAddress, userAgent)
 
     if (!result.success) {
       return NextResponse.json(
@@ -47,7 +47,7 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Create final authenticated session token with session ID
+    // Create final authenticated session token
     const finalToken = await new SignJWT({ 
       userId: result.user!.id, 
       username: result.user!.username,

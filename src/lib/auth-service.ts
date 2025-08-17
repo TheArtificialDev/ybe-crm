@@ -231,16 +231,16 @@ export class AuthService {
         return null
       }
 
-      if (!data || data.length === 0) {
+      if (!data) {
         return null
       }
 
-      const sessionData = data[0]
+      // The function returns a session_result type directly, not in an array
       return {
-        valid: sessionData.is_valid,
-        user_id: sessionData.is_valid ? sessionData.user_id : undefined,
-        username: sessionData.is_valid ? sessionData.username : undefined,
-        expires_at: sessionData.is_valid ? sessionData.expires_at : undefined
+        valid: data.valid,
+        user_id: data.valid ? data.user_id : undefined,
+        username: data.valid ? data.username : undefined,
+        expires_at: data.valid ? data.expires_at : undefined
       }
     } catch (error) {
       console.error('Session validation error:', error)

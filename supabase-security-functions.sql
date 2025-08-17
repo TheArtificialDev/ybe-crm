@@ -1,14 +1,155 @@
 -- Enhanced Security Functions - Zero Service Role Key Required
 -- All security logic enforced at database level with controlled function access
 
--- Drop existing objects if they exist
-DROP FUNCTION IF EXISTS authenticate_user(TEXT, TEXT, INET, TEXT);
-DROP FUNCTION IF EXISTS verify_session(UUID);
-DROP FUNCTION IF EXISTS setup_user_2fa(UUID, TEXT);
-DROP FUNCTION IF EXISTS verify_user_2fa(UUID, TEXT);
-DROP FUNCTION IF EXISTS logout_user(UUID);
-DROP TYPE IF EXISTS auth_result;
-DROP TYPE IF EXISTS session_result;
+-- ========================================
+-- CLEANUP EXISTING OBJECTS FIRST
+-- ========================================
+
+-- Drop any existing functions that might conflict
+DROP FUNCTION IF EXISTS authenticate_user CASCADE;
+DROP FUNCTION IF EXISTS verify_session CASCADE;
+DROP FUNCTION IF EXISTS setup_user_2fa CASCADE;
+DROP FUNCTION IF EXISTS verify_user_2fa CASCADE;
+DROP FUNCTION IF EXISTS complete_2fa_setup CASCADE;
+DROP FUNCTION IF EXISTS get_user_2fa_status CASCADE;
+DROP FUNCTION IF EXISTS logout_user CASCADE;
+DROP FUNCTION IF EXISTS log_auth_attempt CASCADE;
+DROP FUNCTION IF EXISTS clean_expired_sessions CASCADE;
+DROP FUNCTION IF EXISTS unlock_expired_locks CASCADE;
+
+-- Drop existing types
+DROP TYPE IF EXISTS auth_result CASCADE;
+DROP TYPE IF EXISTS session_result CASCADE;
+
+-- ========================================
+-- CREATE TABLES FIRST
+-- ========================================
+
+-- Enable UUID extension if not already enabled
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Enable pgcrypto extension for bcrypt support
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Drop existing tables if they exist (for clean reinstall)
+DROP TABLE IF EXISTS crm_user_sessions CASCADE;
+DROP TABLE IF EXISTS crm_account_lockouts CASCADE;
+DROP TABLE IF EXISTS crm_audit_log CASCADE;
+DROP TABLE IF EXISTS crm_users CASCADE;
+
+-- Create the main users table
+CREATE TABLE crm_users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    has_2fa BOOLEAN DEFAULT false,
+    two_fa_secret TEXT,
+    session_id UUID,
+    session_expires_at TIMESTAMPTZ,
+    failed_login_attempts INTEGER DEFAULT 0,
+    locked_until TIMESTAMPTZ,
+    last_login TIMESTAMPTZ,
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Create user sessions table for tracking active sessions
+CREATE TABLE crm_user_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES crm_users(id) ON DELETE CASCADE,
+    session_id UUID UNIQUE NOT NULL,
+    ip_address INET,
+    user_agent TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    is_active BOOLEAN DEFAULT true
+);
+
+-- Create account lockouts table
+CREATE TABLE crm_account_lockouts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES crm_users(id) ON DELETE CASCADE,
+    locked_until TIMESTAMPTZ NOT NULL,
+    reason TEXT,
+    ip_address INET,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Create comprehensive audit log
+CREATE TABLE crm_audit_log (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES crm_users(id) ON DELETE SET NULL,
+    username TEXT,
+    action TEXT NOT NULL,
+    ip_address INET,
+    user_agent TEXT,
+    success BOOLEAN NOT NULL,
+    error_message TEXT,
+    session_id UUID,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Create indexes for performance
+CREATE INDEX idx_crm_users_username ON crm_users(username);
+CREATE INDEX idx_crm_users_session_id ON crm_users(session_id);
+CREATE INDEX idx_crm_user_sessions_session_id ON crm_user_sessions(session_id);
+CREATE INDEX idx_crm_user_sessions_user_id ON crm_user_sessions(user_id);
+CREATE INDEX idx_crm_audit_log_user_id ON crm_audit_log(user_id);
+CREATE INDEX idx_crm_audit_log_created_at ON crm_audit_log(created_at);
+CREATE INDEX idx_crm_account_lockouts_user_id ON crm_account_lockouts(user_id);
+
+-- Enable Row Level Security
+ALTER TABLE crm_users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE crm_user_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE crm_account_lockouts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE crm_audit_log ENABLE ROW LEVEL SECURITY;
+
+-- ========================================
+-- UTILITY FUNCTIONS
+-- ========================================
+
+-- Function to log authentication attempts
+CREATE OR REPLACE FUNCTION log_auth_attempt(
+    p_user_id UUID,
+    p_username TEXT,
+    p_action TEXT,
+    p_ip_address INET,
+    p_user_agent TEXT,
+    p_success BOOLEAN,
+    p_error_message TEXT DEFAULT NULL,
+    p_session_id UUID DEFAULT NULL
+)
+RETURNS void AS $$
+BEGIN
+    INSERT INTO crm_audit_log (user_id, username, action, ip_address, user_agent, success, error_message, session_id)
+    VALUES (p_user_id, p_username, p_action, p_ip_address, p_user_agent, p_success, p_error_message, p_session_id);
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Function to clean expired sessions
+CREATE OR REPLACE FUNCTION clean_expired_sessions()
+RETURNS void AS $$
+BEGIN
+    DELETE FROM crm_user_sessions WHERE expires_at < NOW();
+    UPDATE crm_users SET session_id = NULL, session_expires_at = NULL 
+    WHERE session_expires_at < NOW();
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Function to unlock expired locks
+CREATE OR REPLACE FUNCTION unlock_expired_locks()
+RETURNS void AS $$
+BEGIN
+    UPDATE crm_users SET locked_until = NULL 
+    WHERE locked_until IS NOT NULL AND locked_until < NOW();
+    DELETE FROM crm_account_lockouts WHERE locked_until < NOW();
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ========================================
+-- MAIN SECURITY FUNCTIONS
+-- ========================================
 
 -- Create custom types for function returns
 CREATE TYPE auth_result AS (
@@ -33,13 +174,13 @@ CREATE TYPE session_result AS (
 -- Function 1: Authenticate user with built-in security checks
 CREATE OR REPLACE FUNCTION authenticate_user(
     p_username TEXT,
-    p_password_hash TEXT,
+    p_password_hash TEXT, -- This is actually the plain password for bcrypt comparison
     p_ip_address INET,
     p_user_agent TEXT
 )
 RETURNS auth_result AS $$
 DECLARE
-    v_user auth_users%ROWTYPE;
+    v_user crm_users%ROWTYPE;
     v_session_id UUID;
     v_session_expires TIMESTAMPTZ;
     v_result auth_result;
@@ -57,7 +198,7 @@ BEGIN
     PERFORM unlock_expired_locks();
 
     -- Get user (bypassing RLS within security definer function)
-    SELECT * INTO v_user FROM auth_users WHERE username = p_username AND is_active = true;
+    SELECT * INTO v_user FROM crm_users WHERE username = p_username AND is_active = true;
 
     -- Check if user exists
     IF NOT FOUND THEN
@@ -76,12 +217,13 @@ BEGIN
         RETURN v_result;
     END IF;
 
-    -- Verify password (simple comparison for now - client should hash)
-    v_password_match := (v_user.password_hash = p_password_hash);
+    -- Verify password using crypt() function for bcrypt comparison
+    -- This compares the plain password with the stored bcrypt hash
+    v_password_match := (crypt(p_password_hash, v_user.password_hash) = v_user.password_hash);
 
     IF NOT v_password_match THEN
         -- Increment failed attempts
-        UPDATE auth_users 
+        UPDATE crm_users 
         SET failed_login_attempts = failed_login_attempts + 1,
             locked_until = CASE 
                 WHEN failed_login_attempts + 1 >= 5 THEN NOW() + INTERVAL '30 minutes'
@@ -101,7 +243,7 @@ BEGIN
     v_session_expires := NOW() + INTERVAL '2 hours';
 
     -- Update user with session and reset failed attempts
-    UPDATE auth_users 
+    UPDATE crm_users 
     SET session_id = v_session_id,
         session_expires_at = v_session_expires,
         failed_login_attempts = 0,
@@ -129,7 +271,7 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 CREATE OR REPLACE FUNCTION verify_session(p_session_id UUID)
 RETURNS session_result AS $$
 DECLARE
-    v_user auth_users%ROWTYPE;
+    v_user crm_users%ROWTYPE;
     v_result session_result;
     v_new_expiry TIMESTAMPTZ;
 BEGIN
@@ -145,7 +287,7 @@ BEGIN
 
     -- Get user by session
     SELECT * INTO v_user 
-    FROM auth_users 
+    FROM crm_users 
     WHERE session_id = p_session_id 
     AND session_expires_at > NOW()
     AND is_active = true;
@@ -160,7 +302,7 @@ BEGIN
     IF v_user.session_expires_at < NOW() + INTERVAL '30 minutes' THEN
         v_new_expiry := NOW() + INTERVAL '2 hours';
         
-        UPDATE auth_users 
+        UPDATE crm_users 
         SET session_expires_at = v_new_expiry,
             updated_at = NOW()
         WHERE id = v_user.id;
@@ -195,7 +337,7 @@ BEGIN
     END IF;
 
     -- Update 2FA settings
-    UPDATE auth_users 
+    UPDATE crm_users 
     SET two_fa_secret = p_two_fa_secret,
         updated_at = NOW()
     WHERE id = v_session.user_id;
@@ -218,7 +360,7 @@ BEGIN
     END IF;
 
     -- Mark 2FA as complete
-    UPDATE auth_users 
+    UPDATE crm_users 
     SET has_2fa = true,
         updated_at = NOW()
     WHERE id = v_session.user_id;
@@ -246,7 +388,7 @@ BEGIN
     -- Return 2FA status
     RETURN QUERY 
     SELECT u.has_2fa, u.two_fa_secret 
-    FROM auth_users u 
+    FROM crm_users u 
     WHERE u.id = v_session.user_id;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
@@ -265,7 +407,7 @@ BEGIN
     END IF;
 
     -- Clear session
-    UPDATE auth_users 
+    UPDATE crm_users 
     SET session_id = NULL,
         session_expires_at = NULL,
         updated_at = NOW()
@@ -279,22 +421,22 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
 -- Update existing tables to block direct access completely
-DROP POLICY IF EXISTS "Service role can manage users" ON auth_users;
-DROP POLICY IF EXISTS "Users can view own data" ON auth_users;
-DROP POLICY IF EXISTS "Block anonymous access" ON auth_users;
+DROP POLICY IF EXISTS "Service role can manage users" ON crm_users;
+DROP POLICY IF EXISTS "Users can view own data" ON crm_users;
+DROP POLICY IF EXISTS "Block anonymous access" ON crm_users;
 
 -- Completely block direct table access - force use of functions only
-CREATE POLICY "Block all direct access to auth_users" ON auth_users
+CREATE POLICY "Block all direct access to crm_users" ON crm_users
     FOR ALL 
     TO anon, authenticated, service_role
     USING (false)
     WITH CHECK (false);
 
 -- Update audit log policies to be more restrictive  
-DROP POLICY IF EXISTS "Service role can manage audit logs" ON auth_audit_log;
-DROP POLICY IF EXISTS "Block non-service access to audit logs" ON auth_audit_log;
+DROP POLICY IF EXISTS "Service role can manage audit logs" ON crm_audit_log;
+DROP POLICY IF EXISTS "Block non-service access to audit logs" ON crm_audit_log;
 
-CREATE POLICY "Block all direct access to audit logs" ON auth_audit_log
+CREATE POLICY "Block all direct access to audit logs" ON crm_audit_log
     FOR ALL 
     TO anon, authenticated, service_role
     USING (false)
@@ -338,3 +480,50 @@ BEGIN
     RAISE NOTICE 'All operations must go through secure database functions.';
     RAISE NOTICE 'Service role key is NO LONGER REQUIRED!';
 END $$;
+
+-- ========================================
+-- CREATE DEFAULT ADMIN USER
+-- ========================================
+
+-- Create the default admin user with bcrypt-hashed password
+-- Username: admin
+-- Password: admin123
+-- Note: In production, this should be changed immediately
+
+DO $$
+DECLARE
+    v_admin_id UUID;
+    v_password_hash TEXT;
+BEGIN
+    -- Generate bcrypt hash for 'admin123' (12 rounds)
+    -- This is the bcrypt hash for 'admin123' with 12 salt rounds
+    v_password_hash := '$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBVJ3fBq1yEuLG';
+    
+    -- Check if admin user already exists
+    SELECT id INTO v_admin_id FROM crm_users WHERE username = 'admin';
+    
+    IF v_admin_id IS NULL THEN
+        -- Create admin user
+        INSERT INTO crm_users (id, username, password_hash, has_2fa, created_at, updated_at)
+        VALUES (
+            gen_random_uuid(),
+            'admin',
+            v_password_hash,
+            false,
+            NOW(),
+            NOW()
+        );
+        
+        -- Log the user creation
+        INSERT INTO crm_audit_log (user_id, username, action, ip_address, user_agent, success, error_message, session_id)
+        VALUES (NULL, 'admin', 'USER_CREATED', NULL, 'system', true, 'Default admin user created', NULL);
+        
+        RAISE NOTICE 'Default admin user created successfully!';
+        RAISE NOTICE 'Username: admin';
+        RAISE NOTICE 'Password: admin123';
+        RAISE NOTICE 'IMPORTANT: Change this password immediately in production!';
+    ELSE
+        RAISE NOTICE 'Admin user already exists - no changes made';
+    END IF;
+END;
+$$;

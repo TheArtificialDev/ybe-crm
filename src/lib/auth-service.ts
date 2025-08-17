@@ -48,13 +48,11 @@ export class AuthService {
         return { success: false, error: 'Username and password are required' }
       }
 
-      // Hash password for database comparison
-      const hashedPassword = await bcrypt.hash(password, SECURITY_CONFIG.BCRYPT_ROUNDS)
-
-      // Call secure database function with anon key
+      // Send plain password - database will handle bcrypt comparison
+      // This is more secure as hashing happens server-side
       const { data, error } = await supabase.rpc('authenticate_user', {
         p_username: username,
-        p_password_hash: hashedPassword,
+        p_password_hash: password, // Send plain password for bcrypt comparison
         p_ip_address: ipAddress || null,
         p_user_agent: userAgent || null
       })

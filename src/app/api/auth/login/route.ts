@@ -6,7 +6,11 @@ export async function POST(request: NextRequest) {
   try {
     const { username, password } = await request.json()
 
+    console.log('🚀 LOGIN API: Received login request for username:', username)
+    console.log('🚀 LOGIN API: Password received:', password ? 'YES' : 'NO')
+
     if (!username || !password) {
+      console.log('❌ LOGIN API: Missing username or password')
       return NextResponse.json(
         { error: 'Username and password are required' },
         { status: 400 }
@@ -17,10 +21,16 @@ export async function POST(request: NextRequest) {
     const ipAddress = AuthService.getClientIP(request)
     const userAgent = request.headers.get('user-agent') || undefined
 
+    console.log('🌐 LOGIN API: Client IP:', ipAddress)
+    console.log('🌐 LOGIN API: User Agent:', userAgent)
+
     // Authenticate user using secure database function
     const result = await AuthService.authenticateUser(username, password, ipAddress, userAgent)
 
+    console.log('📊 LOGIN API: Auth result:', result)
+
     if (!result.success) {
+      console.log('❌ LOGIN API: Authentication failed:', result.error)
       return NextResponse.json(
         { 
           error: result.error,
@@ -30,6 +40,8 @@ export async function POST(request: NextRequest) {
         { status: 401 }
       )
     }
+
+    console.log('✅ LOGIN API: Authentication successful, creating JWT token')
 
     // Create temporary auth token for 2FA flow
     const secret = new TextEncoder().encode(process.env.JWT_SECRET || 'fallback-secret')
@@ -56,11 +68,12 @@ export async function POST(request: NextRequest) {
       maxAge: 900 // 15 minutes
     })
 
+    console.log('🍪 LOGIN API: Auth token cookie set, responding with success')
     return response
   } catch (error) {
-    console.error('Login error:', error)
+    console.error('💥 LOGIN API: Unexpected error:', error)
     return NextResponse.json(
-      { error: 'Internal server error' },
+      { error: 'Internal server error: ' + (error as Error).message },
       { status: 500 }
     )
   }

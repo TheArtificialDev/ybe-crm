@@ -48,6 +48,10 @@ export class AuthService {
         return { success: false, error: 'Username and password are required' }
       }
 
+      console.log('🔍 AUTH DEBUG: Starting authentication for user:', username)
+      console.log('🔍 AUTH DEBUG: Password length:', password.length)
+      console.log('🔍 AUTH DEBUG: IP Address:', ipAddress)
+
       // Send plain password - database will handle bcrypt comparison
       // This is more secure as hashing happens server-side
       const { data, error } = await supabase.rpc('authenticate_user', {
@@ -57,12 +61,17 @@ export class AuthService {
         p_user_agent: userAgent || null
       })
 
+      console.log('🔍 AUTH DEBUG: Database response error:', error)
+      console.log('🔍 AUTH DEBUG: Database response data:', data)
+
       if (error) {
-        console.error('Database authentication error:', error)
-        return { success: false, error: 'Authentication service error' }
+        console.error('❌ Database authentication error:', error)
+        return { success: false, error: 'Authentication service error: ' + error.message }
       }
 
       const result = data as AuthResult
+
+      console.log('🔍 AUTH DEBUG: Parsed result:', result)
 
       if (!result.success) {
         // Handle account lockout
@@ -70,6 +79,7 @@ export class AuthService {
           const lockoutMinutes = Math.ceil(
             (new Date(result.locked_until).getTime() - Date.now()) / 60000
           )
+          console.log('🔒 Account locked until:', result.locked_until, 'Minutes remaining:', lockoutMinutes)
           return { 
             success: false, 
             error: result.error_message || 'Account locked',
@@ -78,10 +88,12 @@ export class AuthService {
           }
         }
         
+        console.log('❌ Authentication failed:', result.error_message)
         return { success: false, error: result.error_message || 'Authentication failed' }
       }
 
       // Success
+      console.log('✅ Authentication successful for user:', result.username)
       return {
         success: true,
         user: { id: result.user_id!, username: result.username! },
@@ -90,8 +102,8 @@ export class AuthService {
       }
 
     } catch (error) {
-      console.error('Authentication error:', error)
-      return { success: false, error: 'Authentication system error' }
+      console.error('💥 Authentication system error:', error)
+      return { success: false, error: 'Authentication system error: ' + (error as Error).message }
     }
   }
 

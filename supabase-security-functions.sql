@@ -185,11 +185,16 @@ DECLARE
     v_session_expires TIMESTAMPTZ;
     v_result auth_result;
     v_password_match BOOLEAN := false;
+    v_debug_msg TEXT;
 BEGIN
+    -- Debug: Log function call
+    RAISE NOTICE 'AUTH DEBUG: authenticate_user called with username: %, password_length: %', p_username, char_length(p_password_hash);
+    
     -- Input validation
     IF char_length(p_username) < 3 OR char_length(p_password_hash) = 0 THEN
         v_result.success := false;
         v_result.error_message := 'Invalid credentials format';
+        RAISE NOTICE 'AUTH DEBUG: Input validation failed - username length: %, password length: %', char_length(p_username), char_length(p_password_hash);
         PERFORM log_auth_attempt(NULL, p_username, 'LOGIN_ATTEMPT', p_ip_address, p_user_agent, false, 'Invalid format', NULL);
         RETURN v_result;
     END IF;
@@ -202,14 +207,19 @@ BEGIN
 
     -- Check if user exists
     IF NOT FOUND THEN
+        RAISE NOTICE 'AUTH DEBUG: User not found for username: %', p_username;
         PERFORM log_auth_attempt(NULL, p_username, 'LOGIN_ATTEMPT', p_ip_address, p_user_agent, false, 'User not found', NULL);
         v_result.success := false;
         v_result.error_message := 'Invalid credentials';
         RETURN v_result;
     END IF;
 
+    RAISE NOTICE 'AUTH DEBUG: User found - ID: %, Username: %, Has2FA: %', v_user.id, v_user.username, v_user.has_2fa;
+    RAISE NOTICE 'AUTH DEBUG: Stored password hash: %', substring(v_user.password_hash, 1, 20) || '...';
+
     -- Check if account is locked
     IF v_user.locked_until IS NOT NULL AND v_user.locked_until > NOW() THEN
+        RAISE NOTICE 'AUTH DEBUG: Account is locked until: %', v_user.locked_until;
         PERFORM log_auth_attempt(v_user.id, p_username, 'LOGIN_BLOCKED', p_ip_address, p_user_agent, false, 'Account locked', NULL);
         v_result.success := false;
         v_result.error_message := 'Account temporarily locked';
@@ -220,8 +230,12 @@ BEGIN
     -- Verify password using crypt() function for bcrypt comparison
     -- This compares the plain password with the stored bcrypt hash
     v_password_match := (crypt(p_password_hash, v_user.password_hash) = v_user.password_hash);
+    
+    RAISE NOTICE 'AUTH DEBUG: Password comparison - Plain: %, Match: %', p_password_hash, v_password_match;
+    RAISE NOTICE 'AUTH DEBUG: crypt result: %', substring(crypt(p_password_hash, v_user.password_hash), 1, 20) || '...';
 
     IF NOT v_password_match THEN
+        RAISE NOTICE 'AUTH DEBUG: Password mismatch - incrementing failed attempts';
         -- Increment failed attempts
         UPDATE crm_users 
         SET failed_login_attempts = failed_login_attempts + 1,
@@ -241,6 +255,8 @@ BEGIN
     -- Successful password verification - generate session
     v_session_id := gen_random_uuid();
     v_session_expires := NOW() + INTERVAL '2 hours';
+
+    RAISE NOTICE 'AUTH DEBUG: Password verified successfully, creating session: %', v_session_id;
 
     -- Update user with session and reset failed attempts
     UPDATE crm_users 
@@ -263,6 +279,7 @@ BEGIN
     v_result.session_id := v_session_id;
     v_result.session_expires_at := v_session_expires;
 
+    RAISE NOTICE 'AUTH DEBUG: Returning success result for user: %', v_user.username;
     RETURN v_result;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
@@ -480,6 +497,52 @@ BEGIN
     RAISE NOTICE 'All operations must go through secure database functions.';
     RAISE NOTICE 'Service role key is NO LONGER REQUIRED!';
 END $$;
+
+-- ========================================
+-- DEBUG FUNCTION FOR TESTING
+-- ========================================
+
+-- Create a debug function to test password comparison
+CREATE OR REPLACE FUNCTION test_password_comparison(
+    p_username TEXT,
+    p_password TEXT
+)
+RETURNS TABLE(
+    user_exists BOOLEAN,
+    stored_hash TEXT,
+    password_match BOOLEAN,
+    crypt_result TEXT
+) AS $$
+DECLARE
+    v_user crm_users%ROWTYPE;
+    v_match BOOLEAN := false;
+    v_crypt_result TEXT;
+BEGIN
+    -- Check if user exists
+    SELECT * INTO v_user FROM crm_users WHERE username = p_username;
+    
+    IF FOUND THEN
+        -- Test password comparison
+        v_crypt_result := crypt(p_password, v_user.password_hash);
+        v_match := (v_crypt_result = v_user.password_hash);
+        
+        RETURN QUERY SELECT 
+            true as user_exists,
+            v_user.password_hash as stored_hash,
+            v_match as password_match,
+            v_crypt_result as crypt_result;
+    ELSE
+        RETURN QUERY SELECT 
+            false as user_exists,
+            NULL::TEXT as stored_hash,
+            false as password_match,
+            NULL::TEXT as crypt_result;
+    END IF;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Grant access to debug function
+GRANT EXECUTE ON FUNCTION test_password_comparison(TEXT, TEXT) TO anon, authenticated;
 
 -- ========================================
 -- CREATE DEFAULT ADMIN USER
